@@ -160,6 +160,29 @@ class ArchitectureTest(absltest.TestCase):
         all(0 <= token_id < self.decoder_vocab_size for token_id in decoded_ids)
     )
 
+  def test_encode_precontext_compresses_middle_tokens(self):
+    precontext_window = 4
+    compression_budget = 3
+    model = architecture.EncoderDecoder(
+        encoder_vocab_size=self.encoder_vocab_size,
+        decoder_vocab_size=self.decoder_vocab_size,
+        encoder_pad_idx=self.encoder_pad_idx,
+        max_encoder_len=32,
+        max_decoder_len=self.max_decoder_len,
+        d_model=self.d_model,
+        num_encoder_layers=1,
+        num_decoder_layers=1,
+        precontext_token_window=precontext_window,
+        compression_token_budget=compression_budget,
+    )
+    src = torch.randint(1, self.encoder_vocab_size, (1, 16))
+
+    memory, memory_key_padding_mask = model.encode(src)
+
+    # 16 -> 8 (middle) compressed to 3, keeping first 4 and last 4.
+    self.assertEqual(memory.shape[1], precontext_window + compression_budget + 4)
+    self.assertEqual(memory_key_padding_mask.shape, (1, memory.shape[1]))
+
 
 if __name__ == "__main__":
   absltest.main()

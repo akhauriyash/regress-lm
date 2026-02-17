@@ -63,12 +63,21 @@ class EncoderDecoder(nn.Module):
       num_encoder_layers: int,
       num_decoder_layers: int,
       decoder_dropout: float = 0.0,
+      precontext_token_window: int | None = None,
+      compression_token_budget: int = 0,
       # encoder args
       encoder_type: encoders.EncoderType = encoders.EncoderType.VANILLA,
       additional_encoder_kwargs: dict[str, Any] | None = None,
   ):
     super().__init__()
     self.encoder_pad_idx = encoder_pad_idx
+    self.precontext_token_window = precontext_token_window or max_encoder_len
+    self.compression_token_budget = compression_token_budget
+    self.use_precontext = (
+        encoder_type is not encoders.EncoderType.T5GEMMA
+        and self.compression_token_budget > 0
+        and self.precontext_token_window > 0
+    )
     self.encoder = encoder_type.make(
         vocab_size=encoder_vocab_size,
         d_model=d_model,
@@ -97,6 +106,68 @@ class EncoderDecoder(nn.Module):
     )
     self.generator = nn.Linear(self.encoder.hidden_dim, decoder_vocab_size)
 
+  def _compress_precontext_memory(
+      self,
+      memory: torch.Tensor,
+      src_padding_mask: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduces very long encoder memories using fixed-budget middle pooling."""
+    if not self.use_precontext:
+      return memory, src_padding_mask
+
+    seq_len = memory.size(1)
+    window = self.precontext_token_window
+    if seq_len <= window:
+      return memory, src_padding_mask
+
+    tail_start = max(seq_len - window, 0)
+    prefix_len = max(seq_len - 2 * window, 0)
+
+    prefix_memory = memory[:, :prefix_len, :]
+    prefix_padding_mask = src_padding_mask[:, :prefix_len]
+
+    middle_memory = memory[:, prefix_len:tail_start, :]
+    middle_padding_mask = src_padding_mask[:, prefix_len:tail_start]
+
+    tail_memory = memory[:, tail_start:, :]
+    tail_padding_mask = src_padding_mask[:, tail_start:]
+
+    middle_len = middle_memory.size(1)
+    if middle_len == 0:
+      return memory, src_padding_mask
+
+    num_chunks = min(self.compression_token_budget, middle_len)
+    base_chunk = middle_len // num_chunks
+    remainder = middle_len % num_chunks
+    compressed_chunks = []
+    compressed_padding_masks = []
+    start = 0
+
+    for i in range(num_chunks):
+      end = start + base_chunk + (remainder if i == num_chunks - 1 else 0)
+      chunk_memory = middle_memory[:, start:end, :]
+      chunk_pad_mask = middle_padding_mask[:, start:end]
+
+      valid = (~chunk_pad_mask).float().unsqueeze(-1)
+      valid_counts = valid.sum(dim=1)
+      pooled_chunk = (chunk_memory * valid).sum(dim=1) / valid_counts.clamp(
+          min=1.0
+      )
+
+      compressed_chunks.append(pooled_chunk.unsqueeze(1))
+      compressed_padding_masks.append((valid_counts.squeeze(-1) == 0).unsqueeze(1))
+      start = end
+
+    compressed_memory = torch.cat(compressed_chunks, dim=1)
+    compressed_padding_mask = torch.cat(compressed_padding_masks, dim=1)
+    return (
+        torch.cat([prefix_memory, compressed_memory, tail_memory], dim=1),
+        torch.cat(
+            [prefix_padding_mask, compressed_padding_mask, tail_padding_mask],
+            dim=1,
+        ),
+    )
+
   def _generate_causal_mask(self, sz: int) -> torch.Tensor:
     return torch.triu(torch.full((sz, sz), float("-inf")), diagonal=1)
 
@@ -105,6 +176,9 @@ class EncoderDecoder(nn.Module):
 
     with nn.attention.sdpa_kernel(SPD_BACKENDS):
       memory = self.encoder(src, src_key_padding_mask=src_padding_mask)
+      memory, src_padding_mask = self._compress_precontext_memory(
+          memory, src_padding_mask
+      )
       decoder_output = self.decoder(
           tgt=self.decoder_positional_encoding(self.tgt_tok_emb(tgt_input)),
           memory=memory,
@@ -118,6 +192,9 @@ class EncoderDecoder(nn.Module):
     src_padding_mask = src == self.encoder_pad_idx
     with nn.attention.sdpa_kernel(SPD_BACKENDS):
       memory = self.encoder(src, src_key_padding_mask=src_padding_mask)
+      memory, src_padding_mask = self._compress_precontext_memory(
+          memory, src_padding_mask
+      )
     return memory, src_padding_mask
 
   def next_token_logits(

@@ -74,6 +74,8 @@ class RegressLM:
         num_encoder_layers=kwargs.get("num_encoder_layers", 2),
         num_decoder_layers=kwargs.get("num_decoder_layers", 2),
         decoder_dropout=kwargs.get("decoder_dropout", 0.0),
+        precontext_token_window=kwargs.get("precontext_token_window", None),
+        compression_token_budget=kwargs.get("compression_token_budget", 0),
         encoder_type=encoders.EncoderType.VANILLA,
         additional_encoder_kwargs=kwargs.get("additional_encoder_kwargs", {}),
     )
